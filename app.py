@@ -1,19 +1,17 @@
-# app.py – Legal Doc Analyzer (detect‑parties only, no generic labels)
+# app.py – Legal Doc Analyzer (improved party detection)
 # -----------------------------------------------------------------------------
-# Workflow
-#   1. User uploads a legal doc.
-#   2. App does a *quick scan* to detect the contracting parties only (no 200‑word
-#      summary, no preview).
-#   3. Presents an exact dropdown list of those parties so the user can declare
-#      which side they represent.
-#   4. Runs a plain‑English deep‑dive analysis from that party’s perspective.
-# -----------------------------------------------------------------------------
-# Run: streamlit run app.py
+# Key fix: Detect real party names instead of generic “Party A / Party B”.
+# Strategy:
+#   • Ask the LLM *not* to return placeholders and include every distinct entity
+#     (companies + individuals) exactly as written.
+#   • Post‑process to drop placeholders like “Party A/B/1/2” if they sneak in.
+#   • If nothing useful remains, ask the LLM a second time with stronger phrasing.
 # -----------------------------------------------------------------------------
 
 import os
 import io
 import json
+import re
 from typing import List
 
 import streamlit as st
@@ -25,11 +23,11 @@ from docx import Document as DocxDocument
 # Config
 # --------------------------------------------------
 openai.api_key = os.getenv("OPENAI_API_KEY", st.secrets.get("OPENAI_API_KEY", ""))
-MODEL = "gpt-4o-mini"  # swap if desired
-MAX_CHARS = 30_000      # truncate very large docs
+MODEL = "gpt-4o-mini"
+MAX_CHARS = 30_000
 
 # --------------------------------------------------
-# Helpers – file loader
+# Helper – load file text
 # --------------------------------------------------
 
 def load_text(upload) -> str:
@@ -46,61 +44,75 @@ def load_text(upload) -> str:
     return text[:MAX_CHARS]
 
 # --------------------------------------------------
-# OpenAI wrappers
+# OpenAI wrapper
 # --------------------------------------------------
 
-def chat(prompt: str) -> str:
+def chat(prompt: str, temperature: float = 0.1) -> str:
     resp = openai.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
+        temperature=temperature,
     )
     return resp.choices[0].message.content.strip()
 
+# --------------------------------------------------
+# Party detection
+# --------------------------------------------------
+
+PLACEHOLDER_RE = re.compile(r"party\s*[ab12]|plaintiff|defendant", re.IGNORECASE)
+
+def _clean_parties(raw_list: List[str]) -> List[str]:
+    clean = []
+    for p in raw_list:
+        if not p or PLACEHOLDER_RE.fullmatch(p.strip()):
+            continue
+        clean.append(p.strip())
+    # Deduplicate (case‑insensitive)
+    seen = set()
+    uniq = []
+    for p in clean:
+        key = p.lower()
+        if key not in seen:
+            uniq.append(p)
+            seen.add(key)
+    return uniq
 
 def detect_parties(doc_text: str) -> List[str]:
-    """Return a list of parties exactly as in document (best effort)."""
-    prompt = f"""
-You are a neutral legal analyst. Identify ALL primary contracting parties mentioned in the agreement exactly as they appear (company names, individuals, etc.).
-Respond ONLY in JSON: {{"parties": ["Party 1", "Party 2", …]}}.
----
-{doc_text}
-"""
-    raw = chat(prompt)
-    try:
-        parties = json.loads(raw).get("parties", [])
-        parties = [p.strip() for p in parties if p.strip()]
-        return parties or ["Could‑not‑detect"]
-    except json.JSONDecodeError:
-        return ["Could‑not‑detect"]
+    """Return real party names (companies / individuals) or empty list if none."""
+    base_prompt = """You are a neutral legal analyst. Identify **all** primary contracting parties in the agreement *exactly* as they appear (company names and individuals). **Do not** invent placeholders like \"Party A\" or \"Party B\". Respond only as valid JSON {{\"parties\": ["Name1", "Name2", …]}}."""
+
+    def ask(prompt_extra: str = "") -> List[str]:
+        raw = chat(f"{base_prompt}\n{prompt_extra}\n---\n{doc_text}\n")
+        try:
+            parties = json.loads(raw).get("parties", [])
+        except json.JSONDecodeError:
+            parties = []
+        return _clean_parties(parties)
+
+    parties = ask()
+    # If nothing useful, try one more time with stronger instruction.
+    if not parties:
+        parties = ask("Remember: return the *actual names*—no placeholders or generic labels.")
+    return parties
 
 # --------------------------------------------------
-# Deep‑dive analysis for chosen party
+# Deep‑dive analysis
 # --------------------------------------------------
 
 def analyze_for_party(party: str, doc_text: str) -> str:
     prompt = f"""
-Please analyze the attached document **strictly from the perspective of {party}** and answer in clear, plain English.
+You are legal counsel for **{party}**. Analyze the agreement below and respond in clear, plain English.
 
-Structure your response exactly as follows:
-
+Structure your answer:
 ## Executive Summary (≤3 sentences)
-
 ## My Key Obligations & Responsibilities (bullets)
-
-## Key Risks & Red Flags (bullets + simple explanation of why)
-
+## Key Risks & Red Flags (bullets + why they matter)
 ## Key Benefits & Protections (bullets)
-
-## Jargon Buster (explain 3–5 key legal terms)
-
-## Questions to Ask (3–5 questions)
-
-Respond in markdown.
----
-{doc_text}
+## Jargon Buster (explain 3–5 key terms)
+## Questions to Ask (3–5)
+---\n{doc_text}
 """
-    return chat(prompt)
+    return chat(prompt, temperature=0.2)
 
 # --------------------------------------------------
 # Streamlit UI
@@ -114,11 +126,15 @@ if "stage" not in st.session_state:
 
 upload = st.file_uploader("Upload PDF, DOCX, or TXT", type=["pdf", "docx", "txt"])
 
+# Stage 0 – upload and detect
 if upload and st.session_state.stage == 0:
     st.session_state.doc = load_text(upload)
     with st.spinner("Detecting parties …"):
         st.session_state.parties = detect_parties(st.session_state.doc)
-    st.session_state.stage = 1
+    if st.session_state.parties:
+        st.session_state.stage = 1
+    else:
+        st.error("Could not reliably detect parties. Please review the document text.")
     st.rerun()
 
 # Stage 1 – choose party
