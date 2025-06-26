@@ -1,12 +1,13 @@
-# app.py – Legal Doc Analyzer (plain-English, party selector fixed)
+# app.py – Legal Doc Analyzer (no preview, party‑selector flow)
 # -----------------------------------------------------------------------------
 # Streamlit workflow
-#   1. Upload legal doc (PDF, DOCX, TXT)
-#   2. First-pass neutral summary + detect parties
-#   3. User chooses the side they represent from a dropdown
-#   4. Deep-dive analysis tailored to that side (plain English)
+#   1. User uploads a legal doc (PDF, DOCX, TXT)
+#   2. App performs a *quick first‑pass scan* to detect contracting parties and give a
+#      neutral executive summary (no raw text preview shown to the user).
+#   3. User selects which party they represent from a dropdown list.
+#   4. App runs a plain‑English deep‑dive analysis from that party’s perspective.
 # -----------------------------------------------------------------------------
-# Run:  streamlit run app.py
+# Run: streamlit run app.py
 # -----------------------------------------------------------------------------
 
 import os
@@ -24,14 +25,14 @@ from docx import Document as DocxDocument
 # --------------------------------------------------
 openai.api_key = os.getenv("OPENAI_API_KEY", st.secrets.get("OPENAI_API_KEY", ""))
 MODEL_NAME = "gpt-4o-mini"  # change if desired
-MAX_CHARS = 30_000           # truncate very large docs for safety
+MAX_CHARS = 30_000           # truncate huge docs for safety
 
 # --------------------------------------------------
-# Helper – file loader
+# Helpers – load file text
 # --------------------------------------------------
 
 def load_file_text(upload) -> str:
-    """Extract raw text (first MAX_CHARS) from uploaded PDF/DOCX/TXT."""
+    """Return raw text (first MAX_CHARS) from an uploaded PDF/DOCX/TXT."""
     name = upload.name.lower()
     data = upload.read()
     if name.endswith(".pdf"):
@@ -45,26 +46,25 @@ def load_file_text(upload) -> str:
     return text[:MAX_CHARS]
 
 # --------------------------------------------------
-# OpenAI chat helpers
+# OpenAI chat wrappers
 # --------------------------------------------------
 
 def _chat(prompt: str) -> str:
-    """Light wrapper around a single chat completion."""
-    response = openai.chat.completions.create(
+    resp = openai.chat.completions.create(
         model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
     )
-    return response.choices[0].message.content.strip()
+    return resp.choices[0].message.content.strip()
 
 
 def first_pass_analysis(doc_text: str) -> Dict[str, Any]:
-    """Return neutral exec summary + detected parties."""
+    """Return exec summary + detected parties list."""
     prompt = f"""
 You are a neutral legal analyst. Read the contract below and:
-1. Give an executive summary (≤200 words).
-2. List the primary parties exactly as they appear.
-Respond ONLY in valid JSON of the form {{"summary": "…", "parties": ["…", …]}}.
+1. Produce an executive summary (≤200 words).
+2. List the primary contracting parties exactly as written.
+Respond ONLY in valid JSON: {{"summary": "…", "parties": ["…", …]}}.
 ---
 CONTRACT:\n\n{doc_text}
 """
@@ -74,12 +74,11 @@ CONTRACT:\n\n{doc_text}
         parties = [p.strip() for p in data.get("parties", []) if p.strip()] or ["Party A", "Party B"]
         return {"summary": data.get("summary", ""), "parties": parties}
     except json.JSONDecodeError:
-        # If the LLM failed JSON format, fall back gracefully
         return {"summary": raw, "parties": ["Party A", "Party B"]}
 
 
 def side_focused_analysis(party: str, doc_text: str) -> str:
-    """Return structured markdown analysis from *party* perspective."""
+    """Return plain‑English analysis for the chosen party."""
     prompt = f"""
 Please analyze the attached document from the perspective of **{party}** and provide a detailed breakdown in **simple, clear, plain English**.
 
@@ -92,7 +91,7 @@ Structure your response exactly as follows:
 • Bullet every action I must take, promises I make, responsibilities I accept. Include any deadlines.
 
 ## Key Risks & Red Flags  
-• Bullet the most significant risks for me. Highlight unusual, one-sided, ambiguous, or problematic clauses and explain **why** they are risky in simple terms.
+• Bullet the most significant risks for me. Highlight unusual, one‑sided, ambiguous, or problematic clauses and explain **why** they are risky in simple terms.
 
 ## Key Benefits & Protections  
 • Bullet clauses that clearly protect my interests or benefit me.
@@ -110,55 +109,60 @@ CONTRACT TEXT:\n\n{doc_text}
     return _chat(prompt)
 
 # --------------------------------------------------
-# Streamlit UI logic
+# Streamlit UI
 # --------------------------------------------------
 
 st.set_page_config(page_title="Legal Doc Analyzer", layout="wide")
-st.title("📄 Legal Document Analyzer (Plain-English Edition)")
+st.title("📄 Legal Document Analyzer – Party‑Specific")
 
+# Session state defaults
 if "stage" not in st.session_state:
-    st.session_state.stage = 0            # 0 = upload, 1 = parties select, 2 = side analysis
-    st.session_state.summary = ""
-    st.session_state.parties = []
-    st.session_state.doc_text = ""
+    st.session_state.update({
+        "stage": 0,            # 0 upload → 1 choose party → 2 analysis
+        "summary": "",
+        "parties": [],
+        "doc_text": "",
+        "side_md": "",
+    })
 
 upload = st.file_uploader("Upload PDF, DOCX, or TXT", type=["pdf", "docx", "txt"])
 
 if upload:
-    text = load_file_text(upload)
-    st.session_state.doc_text = text   # store for later reuse
     st.success(f"Loaded **{upload.name}**")
-    st.write("Preview (first 1 000 chars):")
-    st.code(text[:1000] + ("…" if len(text) > 1000 else ""), language="text")
-
+    # Store the full text once so we don’t reload after reruns
     if st.session_state.stage == 0:
-        if st.button("🔍 First-Pass Analysis", disabled=(openai.api_key == "")):
-            with st.spinner("Running first pass …"):
-                data = first_pass_analysis(text)
+        st.session_state.doc_text = load_file_text(upload)
+
+    # --- Stage 0: run first pass ---
+    if st.session_state.stage == 0:
+        if st.button("🔍 Detect Parties & Summarize", disabled=(openai.api_key == "")):
+            with st.spinner("Scanning document …"):
+                data = first_pass_analysis(st.session_state.doc_text)
             st.session_state.summary = data["summary"]
             st.session_state.parties = data["parties"]
             st.session_state.stage = 1
             st.rerun()
 
+    # --- Stage 1: show summary + party selector ---
     elif st.session_state.stage == 1:
         st.markdown("## 📝 Executive Summary (Neutral)")
         st.markdown(st.session_state.summary or "_No summary returned_")
-        selected_party = st.selectbox("Select the side you represent", st.session_state.parties)
-        if st.button("⚖️ Deep Dive for My Side"):
-            with st.spinner("Analyzing from your side …"):
-                analysis_md = side_focused_analysis(selected_party, st.session_state.doc_text)
-            st.session_state.side_md = analysis_md
+        party_choice = st.selectbox("Select the party you represent", st.session_state.parties)
+        if st.button("⚖️ Analyze from My Perspective"):
+            with st.spinner("Deep‑diving …"):
+                md = side_focused_analysis(party_choice, st.session_state.doc_text)
+            st.session_state.side_md = md
             st.session_state.stage = 2
             st.rerun()
 
+    # --- Stage 2: show party‑specific analysis ---
     elif st.session_state.stage == 2:
         st.markdown(st.session_state.side_md)
-        if st.button("🔁 Analyze New Document"):
+        if st.button("🔁 Start Over"):
             st.session_state.clear()
-            st.session_state.stage = 0
             st.rerun()
 else:
-    st.info("⬆️ Upload a legal document to get started.")
+    st.info("⬆️ Upload a legal document to begin.")
 
 st.markdown("---")
-st.caption("_Automated analysis – not legal advice. Always consult qualified counsel._")
+st.caption("_Automated analysis – not legal advice. Consult qualified counsel._")
