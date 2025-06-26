@@ -78,7 +78,7 @@ Structure your answer with these sections:
 # --------------------------------------------------
 
 st.set_page_config(page_title="Legal Doc Analyzer", layout="wide")
-st.title("📄 Legal Document Analyzer – Your Perspective")
+st.title("📄 Derek's Legal Document Analyzer")
 
 # Session state keys: doc_text, analysis
 
