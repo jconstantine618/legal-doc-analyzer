@@ -1,11 +1,15 @@
-# app.py – Legal Doc Analyzer (improved party detection)
+# app.py – Legal Doc Analyzer (party‑detect + manual fallback)
 # -----------------------------------------------------------------------------
-# Key fix: Detect real party names instead of generic “Party A / Party B”.
-# Strategy:
-#   • Ask the LLM *not* to return placeholders and include every distinct entity
-#     (companies + individuals) exactly as written.
-#   • Post‑process to drop placeholders like “Party A/B/1/2” if they sneak in.
-#   • If nothing useful remains, ask the LLM a second time with stronger phrasing.
+# Flow
+#   1. Upload legal doc (PDF, DOCX, TXT)
+#   2. Try to auto‑detect all parties *exactly* as named in the agreement. If at
+#      least two parties are found → show a dropdown so the user can pick their
+#      side.
+#   3. If detection fails or finds <2 parties → prompt the user to manually enter
+#      party names (comma‑separated) to proceed.
+#   4. Perform plain‑English deep‑dive analysis for the selected party.
+# -----------------------------------------------------------------------------
+# Run: streamlit run app.py
 # -----------------------------------------------------------------------------
 
 import os
@@ -27,7 +31,7 @@ MODEL = "gpt-4o-mini"
 MAX_CHARS = 30_000
 
 # --------------------------------------------------
-# Helper – load file text
+# Helper – load text from uploaded file
 # --------------------------------------------------
 
 def load_text(upload) -> str:
@@ -35,7 +39,7 @@ def load_text(upload) -> str:
     data = upload.read()
     if name.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(data))
-        text = "\n".join(p.extract_text() or "" for p in reader.pages)
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
     elif name.endswith(".docx"):
         doc = DocxDocument(io.BytesIO(data))
         text = "\n".join(p.text for p in doc.paragraphs)
@@ -56,50 +60,55 @@ def chat(prompt: str, temperature: float = 0.1) -> str:
     return resp.choices[0].message.content.strip()
 
 # --------------------------------------------------
-# Party detection
+# Party detection util
 # --------------------------------------------------
 
 PLACEHOLDER_RE = re.compile(r"party\s*[ab12]|plaintiff|defendant", re.IGNORECASE)
 
-def _clean_parties(raw_list: List[str]) -> List[str]:
-    clean = []
-    for p in raw_list:
-        if not p or PLACEHOLDER_RE.fullmatch(p.strip()):
-            continue
-        clean.append(p.strip())
-    # Deduplicate (case‑insensitive)
+
+def _clean_parties(raw: List[str]) -> List[str]:
+    out = []
     seen = set()
-    uniq = []
-    for p in clean:
-        key = p.lower()
+    for p in raw:
+        if not p:
+            continue
+        if PLACEHOLDER_RE.fullmatch(p.strip()):  # skip placeholders
+            continue
+        key = p.strip().lower()
         if key not in seen:
-            uniq.append(p)
+            out.append(p.strip())
             seen.add(key)
-    return uniq
+    return out
 
-def detect_parties(doc_text: str) -> List[str]:
-    """Return real party names (companies / individuals) or empty list if none."""
-    base_prompt = """You are a neutral legal analyst. Identify **all** primary contracting parties in the agreement (company names and individuals). **Do not** invent placeholders like \"Party A\" or \"Party B\". Respond only as valid JSON {{\"parties\": ["Name1", "Name2", …]}}."""
 
-    def ask(prompt_extra: str = "") -> List[str]:
-        raw = chat(f"{base_prompt}\n{prompt_extra}\n---\n{doc_text}\n")
+def detect_parties(text: str) -> List[str]:
+    """Best‑effort party extraction via LLM; returns deduped list or []."""
+    base_prompt = (
+        "You are a neutral legal analyst. Identify **every** primary contracting "
+        "party (companies and individuals) *exactly* as they appear in the "
+        "agreement. Respond ONLY as valid JSON: {\"parties\": ["Party 1", "Party 2", …]} "
+        "and do NOT use placeholders like Party A/B."
+    )
+
+    def ask(extra: str = "") -> List[str]:
+        raw = chat(f"{base_prompt}\n{extra}\n---\n{text}\n")
         try:
-            parties = json.loads(raw).get("parties", [])
+            plist = json.loads(raw).get("parties", [])
         except json.JSONDecodeError:
-            parties = []
-        return _clean_parties(parties)
+            plist = []
+        return _clean_parties(plist)
 
     parties = ask()
-    # If nothing useful, try one more time with stronger instruction.
-    if not parties:
-        parties = ask("Remember: return the *actual names*—no placeholders or generic labels.")
+    if len(parties) < 2:
+        # one more attempt with a reminder
+        parties = ask("Return at least the two primary names – no placeholders.")
     return parties
 
 # --------------------------------------------------
-# Deep‑dive analysis
+# Deep dive analysis
 # --------------------------------------------------
 
-def analyze_for_party(party: str, doc_text: str) -> str:
+def analyze_for_party(party: str, text: str) -> str:
     prompt = f"""
 You are legal counsel for **{party}**. Analyze the agreement below and respond in clear, plain English.
 
@@ -110,7 +119,7 @@ Structure your answer:
 ## Key Benefits & Protections (bullets)
 ## Jargon Buster (explain 3–5 key terms)
 ## Questions to Ask (3–5)
----\n{doc_text}
+---\n{text}
 """
     return chat(prompt, temperature=0.2)
 
@@ -122,26 +131,40 @@ st.set_page_config(page_title="Legal Doc Analyzer", layout="wide")
 st.title("📄 Legal Document Analyzer – Pick Your Side")
 
 if "stage" not in st.session_state:
-    st.session_state.update({"stage": 0, "doc": "", "parties": [], "analysis": ""})
+    st.session_state.update({
+        "stage": 0,      # 0=upload  1=select/enter party  2=analysis
+        "doc": "",
+        "parties": [],
+        "analysis": "",
+    })
 
 upload = st.file_uploader("Upload PDF, DOCX, or TXT", type=["pdf", "docx", "txt"])
 
-# Stage 0 – upload and detect
+# Stage 0 – upload and auto‑detect
 if upload and st.session_state.stage == 0:
     st.session_state.doc = load_text(upload)
     with st.spinner("Detecting parties …"):
         st.session_state.parties = detect_parties(st.session_state.doc)
-    if st.session_state.parties:
-        st.session_state.stage = 1
-    else:
-        st.error("Could not reliably detect parties. Please review the document text.")
+    st.session_state.stage = 1  # go to party selection (even if empty)
     st.rerun()
 
-# Stage 1 – choose party
+# Stage 1 – party selection or manual entry
 if st.session_state.stage == 1:
-    st.markdown("### Select the party you represent")
-    party = st.selectbox("I represent", st.session_state.parties, key="party_choice")
-    if st.button("⚖️ Analyze for My Side"):
+    if len(st.session_state.parties) >= 2:
+        st.markdown("### Select the party you represent")
+        party = st.selectbox("I represent", st.session_state.parties, key="party_choice")
+    else:
+        st.warning("Could not confidently detect at least two parties. Please enter them manually (comma‑separated). Example: Company A, Company B")
+        manual = st.text_input("Parties (comma‑separated)")
+        # Parse manual entry into list when user types
+        party_list = [p.strip() for p in manual.split(",") if p.strip()]
+        if len(party_list) >= 2:
+            st.session_state.parties = party_list
+            party = st.selectbox("I represent", st.session_state.parties, key="party_choice_manual")
+        else:
+            party = None
+
+    if party and st.button("⚖️ Analyze for My Side"):
         with st.spinner("Generating analysis …"):
             st.session_state.analysis = analyze_for_party(party, st.session_state.doc)
         st.session_state.stage = 2
