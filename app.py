@@ -79,7 +79,7 @@ def _clean_parties(raw_list: List[str]) -> List[str]:
 
 def detect_parties(doc_text: str) -> List[str]:
     """Return real party names (companies / individuals) or empty list if none."""
-    base_prompt = """You are a neutral legal analyst. Identify **all** primary contracting parties in the agreement *exactly* as they appear (company names and individuals). **Do not** invent placeholders like \"Party A\" or \"Party B\". Respond only as valid JSON {{\"parties\": ["Name1", "Name2", …]}}."""
+    base_prompt = """You are a neutral legal analyst. Identify **all** primary contracting parties in the agreement (company names and individuals). **Do not** invent placeholders like \"Party A\" or \"Party B\". Respond only as valid JSON {{\"parties\": ["Name1", "Name2", …]}}."""
 
     def ask(prompt_extra: str = "") -> List[str]:
         raw = chat(f"{base_prompt}\n{prompt_extra}\n---\n{doc_text}\n")
